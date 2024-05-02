@@ -1,0 +1,225 @@
+#!/usr/bin/env python3
+
+import argparse
+import socket
+import ssl
+import re
+import zlib
+import urllib.parse
+from html.parser import HTMLParser
+
+DEFAULT_SERVER = "www.3700.network"
+DEFAULT_PORT = 443
+
+class MyHTMLParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.urls = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag == 'a':
+            for attr, value in attrs:
+                if attr == 'href' and value.startswith('/fakebook/'):
+                    self.urls.append(value)
+
+    def get_urls(self):
+        return self.urls
+
+class Crawler:
+    def __init__(self, args):
+        self.server = args.server
+        self.port = args.port
+        self.username = args.username
+        self.password = args.password
+        self.cookie = None
+        self.visited_urls = {}
+        self.frontier = set()  
+        self.csrf = "\r\n"    
+
+    def extract_urls(self, response):
+        parser = MyHTMLParser()
+        parser.feed(response)
+        urls = parser.get_urls()
+        return [f"https://{self.server}{url}" for url in urls]  # Prefix the domain to each URL
+
+    def is_valid_url(self, url):
+        # Assuming all URLs starting with /fakebook/ are valid for simplicity
+        return url.startswith(f"https://{self.server}/fakebook/")
+
+    def receive_full_response(self, mysocket):
+        response_bytes = b''
+        # response = ''
+        # content_length = 0
+        status_code = None
+        gzip_encoded = False
+
+        while True:
+            part = mysocket.recv(4096)
+            response_bytes += part
+
+            # Check if the response is complete
+            if b"</html>" in response_bytes or b"302 Found" in response_bytes:
+                break
+
+        # Check for gzip encoding
+        if b"Content-Encoding: gzip" in response_bytes:
+            gzip_encoded = True
+
+        # Decode the response
+        if gzip_encoded:
+            # Decompress gzip-encoded response
+            response = zlib.decompress(response_bytes, 16 + zlib.MAX_WBITS).decode("utf-8")
+        else:
+            # Decode normally if not gzip-encoded
+            response = response_bytes.decode("utf-8")
+
+        if status_code is None:
+            status_match = re.search(r'HTTP/1.1 (\d{3})', response)
+            if status_match:
+                status_code = int(status_match.group(1))
+
+        return response, status_code
+
+    def login_to_fakebook(self, mysocket, login_request):
+        # Fetch the login page to get the CSRF token
+        mysocket.send(f'GET /accounts/login/?next=/fakebook/ HTTP/1.1\r\nHost:{self.server}:{self.port}\r\n\r\n'.encode('ascii'))
+        login_page_response, status_code = self.receive_full_response(mysocket)
+
+        # Extract the CSRF token
+        csrf_token_match = re.search(r'csrfmiddlewaretoken" value="(\w+)"', login_page_response)
+        if csrf_token_match:
+            self.csrf = csrf_token_match.group(1)
+        else:
+            self.login_to_fakebook(mysocket, login_request)
+            return
+        
+        # Construct the login request with the token
+        login_request = "POST /accounts/login/?next=/fakebook/ HTTP/1.1\r\nHost: {}\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\nCookie: csrftoken={}\r\nConnection: keep-alive\r\n\r\nusername={}&password={}&csrfmiddlewaretoken={}".format(
+            self.server,
+            len(f"username={self.username}&password={self.password}&csrfmiddlewaretoken={self.csrf}"),
+            self.csrf,
+            self.username,
+            self.password,
+            self.csrf
+        )
+
+        # Send the login request
+        mysocket.send(login_request.encode('ascii'))
+        response, status_code = self.receive_full_response(mysocket)
+
+        if status_code == 200:
+            # Handle the 200 OK status code
+            # Extract cookies and proceed with your logic
+            for line in response.split('\r\n'):
+                if line.startswith('set-cookie'):
+                    self.cookie = line.split(': ')[1].split(';')[0]
+                    break
+
+            # Next request with the cookie
+            if self.cookie:
+                request = "GET /fakebook/ HTTP/1.1\r\nHost: {}\r\nCookie: {}\r\n\r\n".format(self.server, self.cookie)
+                mysocket.send(request.encode('ascii'))
+                data, status_code = self.receive_full_response(mysocket)
+
+        elif status_code == 302:
+                # Extract cookies and location for redirection
+                location = None
+                for line in response.split('\r\n'):
+                    if line.startswith('set-cookie'):
+                        self.cookie = line.split(': ')[1].split(';')[0]
+                    elif line.lower().startswith('location'):
+                        location = line.split(': ')[1].strip()
+
+                # Follow the redirection if location and cookie are available
+                if self.cookie and location:
+                    request = f"GET {location} HTTP/1.1\r\nHost: {self.server}\r\nCookie: {self.cookie}\r\n\r\n"
+                    mysocket.send(request.encode('ascii'))
+                    data, status_code = self.receive_full_response(mysocket)
+                else:
+                    print("Redirect location or cookie not found in 302 response")
+                    
+
+        elif status_code in [403, 404]:
+            print("Login failed with status code:", status_code)
+            return
+        elif status_code == 503:
+            print("Service unavailable, retrying...")
+            self.login_to_fakebook(mysocket, login_request)
+        else:
+            print("Failed to fetch the login page with status code:", status_code)
+
+    def crawl(self, mysocket):
+        flags_list = []
+        # Initialize the stack for the frontier with the root URL
+        self.frontier.add(f"https://{self.server}/fakebook/")
+        self.visited_urls[f"https://{self.server}/fakebook/"] = False
+
+        while self.frontier:
+            # Pop the URL from the frontier
+            url = self.frontier.pop()
+            # Check if the URL has been visited
+            if url not in self.visited_urls or self.visited_urls[url] == False:
+                # Mark the URL as visited
+                self.visited_urls[url] = True
+
+                # Send a GET request for the URL
+                request = f"GET {urllib.parse.urlparse(url).path} HTTP/1.1\r\nHost: {self.server}\r\nCookie: {self.cookie}\r\nConnection: keep-alive\r\n\r\n"
+                mysocket.send(request.encode('ascii'))
+                response, status_code = self.receive_full_response(mysocket)
+
+
+                # If the status code is 200, extract URLs and search for secret flags
+                if status_code == 200:
+                    # case 1: main page
+                    new_urls = self.extract_urls(response) 
+                    for new_url in new_urls:
+                        if new_url not in self.visited_urls:
+                            self.frontier.add(new_url)
+                            self.visited_urls[new_url] = False
+
+                    # Search for secret flags
+                    flags = re.findall(r"<h3 class='secret_flag' style=\"color:red\">FLAG: ([\w\d]+)</h3>", response)
+                    for flag in flags:
+                        flags_list.append(flag)
+                        print(flag)
+                    if(len(flags_list) == 5):
+                        break
+
+                # If the status code is 302, follow the redirect
+                elif status_code == 302:
+                    location_match = re.search(r'Location: (.+)', response)
+                    if location_match:
+                        location = location_match.group(1)
+                        if self.is_valid_url(location) and location not in self.visited_urls:
+                            self.frontier.add(location)
+                    else:
+                        print("Location header not found in 302 response")
+
+    def run(self):
+
+        login_request = "POST /accounts/login/ HTTP/1.1\r\nHost: {}\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\nusername={}&password={}".format(
+            self.server,
+            len(f"username={self.username}&password={self.password}"),
+            self.username,
+            self.password
+        )
+
+        # Socket creation
+        mysocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
+        mysocket = context.wrap_socket(mysocket, server_hostname=self.server)
+        mysocket.connect((self.server, self.port))
+
+        self.login_to_fakebook(mysocket, login_request)
+        self.crawl(mysocket)
+        mysocket.close()
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='crawl Fakebook')
+    parser.add_argument('-s', dest="server", type=str, default=DEFAULT_SERVER, help="The server to crawl")
+    parser.add_argument('-p', dest="port", type=int, default=DEFAULT_PORT, help="The port to use")
+    parser.add_argument('username', type=str, help="The username to use")
+    parser.add_argument('password', type=str, help="The password to use")
+    args = parser.parse_args()
+    sender = Crawler(args)
+    sender.run()
